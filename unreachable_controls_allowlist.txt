@@ -138,7 +138,6 @@ src/bernstein/core/security/capability_tokens.py::mint_root                     
 src/bernstein/core/security/capability_tokens.py::sign_token                                   # exported in the module's __all__ and exercised by tests; no production caller
 src/bernstein/core/security/capability_tokens.py::to_actor_claims                              # exported in the module's __all__ and exercised by tests; no production caller
 src/bernstein/core/security/change_receipt.py::ChangeReceiptError                              # no production caller and no test reference; baseline entry from the first scan
-src/bernstein/core/security/claude_permission_profiles.py::PermissionProfile.to_settings_json  # exercised by tests only; no production caller
 src/bernstein/core/security/claude_permission_profiles.py::PermissionProfileManager            # exercised by tests only; no production caller
 src/bernstein/core/security/claude_tool_result_injection.py::ToolResultInjector.has_failures   # exercised by tests only; no production caller
 src/bernstein/core/security/command_allowlist.py::AllowlistVerdict                             # no production caller and no test reference; baseline entry from the first scan
