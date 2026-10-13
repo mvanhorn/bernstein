@@ -1400,6 +1400,10 @@ def _require_adapter_configured(cli: str | None, workdir: Path) -> None:
     first-run exemption: the goal bootstrap takes the PID lock, which creates
     ``.sdd/``, before it decides whether to write a default seed, so a fresh
     directory never gets one and the orchestrator would hit the FATAL.
+
+    Scope: this guards the no-flag, no-env, no-seed case only. A seed that
+    exists but resolves to ``cli: auto`` with no adapter installed passes
+    here and still reaches the orchestrator's single FATAL.
     """
     if (cli or "").strip() not in ("", "auto") or os.environ.get("BERNSTEIN_ADAPTER", "").strip():
         return
