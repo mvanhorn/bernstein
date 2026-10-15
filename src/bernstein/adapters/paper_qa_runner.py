@@ -15,8 +15,8 @@ The sources recorded are the papers the answer cites, one entry per paper:
 its URL or DOI link when PaperQA2 has one, else its citation.
 
 Exit codes: 0 ok, 3 inconclusive (no answer, or PaperQA2 was unsure or cut
-short), 1 the agent failed, 2 PaperQA2 is not installed in this interpreter
-or the papers directory is missing.
+short), 1 the agent failed, 2 PaperQA2 is not installed in this interpreter,
+or the papers directory is missing or holds no files.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ def _isolate_and_load_artifact() -> Any:
     return module
 
 
-def build_settings(paperqa: Any, papers_dir: Path, model: str, embedding: str) -> Any:
+def paperqa_settings(paperqa: Any, papers_dir: Path, model: str, embedding: str) -> Any:
     """PaperQA2 settings with every model on the gateway and metadata lookup off."""
     llm = f"openai/{model}"
     return paperqa.Settings(
@@ -60,6 +60,14 @@ def build_settings(paperqa: Any, papers_dir: Path, model: str, embedding: str) -
         embedding=f"openai/{embedding}",
         agent={"agent_llm": llm, "index": {"paper_directory": str(papers_dir)}},
         parsing={"use_doc_details": False, "enrichment_llm": llm},
+    )
+
+
+def has_papers(papers_dir: Path) -> bool:
+    """Whether ``papers_dir`` holds at least one file that is not hidden."""
+    return any(
+        path.is_file() and not any(part.startswith(".") for part in path.relative_to(papers_dir).parts)
+        for path in papers_dir.rglob("*")
     )
 
 
@@ -92,6 +100,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.papers_dir.is_dir():
         print(f"no papers directory at {args.papers_dir}", file=sys.stderr)
         return 2
+    # An empty corpus indexes nothing, and PaperQA2 would answer with no context.
+    if not has_papers(args.papers_dir):
+        print(f"papers directory {args.papers_dir} holds no files", file=sys.stderr)
+        return 2
     try:
         import paperqa  # type: ignore[import-not-found]
     except ImportError as exc:
@@ -101,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     query = args.prompt_file.read_text(encoding="utf-8")
     started = time.time()
     try:
-        settings = build_settings(paperqa, args.papers_dir.resolve(), args.model, args.embedding)
+        settings = paperqa_settings(paperqa, args.papers_dir.resolve(), args.model, args.embedding)
         response = asyncio.run(paperqa.agent_query(query, settings, agent_type=settings.agent.agent_type))
         status = str(response.status)
         if status == _FAILED:

@@ -424,6 +424,7 @@ def _run_paper_qa(tmp_path: Path, status: str) -> subprocess.CompletedProcess[st
     pkg.mkdir(parents=True, exist_ok=True)
     (pkg / "__init__.py").write_text(_STUB_PAPERQA)
     (tmp_path / "papers").mkdir(exist_ok=True)
+    (tmp_path / "papers" / "x.txt").write_text("X is Y.")
     (tmp_path / "p.txt").write_text("What is X?")
     return subprocess.run(
         [
@@ -490,6 +491,33 @@ def test_paper_qa_runner_without_papers_exits_2(tmp_path: Path) -> None:
     )
     assert proc.returncode == 2
     assert "no papers directory" in proc.stderr
+
+
+def test_paper_qa_runner_with_no_paper_files_exits_2(tmp_path: Path) -> None:
+    """An empty corpus fails loudly instead of letting PaperQA2 answer with no context."""
+    papers = tmp_path / "papers"
+    (papers / "sub").mkdir(parents=True)
+    (papers / ".DS_Store").write_text("")
+    (tmp_path / "p.txt").write_text("q")
+    proc = _run_runner(
+        "paper_qa_runner.py",
+        [
+            "--prompt-file",
+            str(tmp_path / "p.txt"),
+            "--out-dir",
+            str(tmp_path / "o"),
+            "--papers-dir",
+            str(papers),
+            "--model",
+            "m",
+            "--embedding",
+            "e",
+        ],
+        {},
+    )
+    assert proc.returncode == 2
+    assert "holds no files" in proc.stderr
+    assert not (tmp_path / "o").exists()
 
 
 _STUB_TOOL_SEARCH = """

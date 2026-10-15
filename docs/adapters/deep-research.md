@@ -12,6 +12,12 @@ not a commit.
 
 ## The run artifact
 
+A deep-research adapter's product is the report (for PaperQA2, the cited
+answer) in this run directory, not a commit and not a task's declared
+artifact: none of the three publishes it to a task's
+`artifact_spec.output_path`, so none declares the `artifact` output mode. A task that declares an artifact kind and runs on
+one of them will not complete through the artifact path.
+
 Each run writes three files to `.sdd/<agent>/<session>/` in the task's
 working directory:
 
@@ -58,17 +64,61 @@ model). Its own tool settings (`SERPER_KEY_ID`, `JINA_API_KEYS`,
 `SANDBOX_FUSION_ENDPOINT`, `MAX_LLM_CALL_PER_RUN`) are passed through
 unchanged.
 
+Its search, scholar and visit tools call `google.serper.dev` and `r.jina.ai`
+directly. Two variables send them elsewhere, for example to a gateway that
+meters and logs web access:
+
+| Variable | Effect |
+|---|---|
+| `BERNSTEIN_TONGYI_DEEPRESEARCH_SERPER_BASE_URL` | Serper requests go to this base, path appended (`https://gw/v1` → `https://gw/v1/search`, `/v1/scholar`) |
+| `BERNSTEIN_TONGYI_DEEPRESEARCH_JINA_BASE_URL` | reader requests go to `<base>/<page url>` instead of `https://r.jina.ai/<page url>` |
+
+Only the address changes: headers (`SERPER_KEY_ID` as `X-API-KEY`,
+`JINA_API_KEYS` as a bearer token), request bodies and response parsing stay
+the agent's own, so the endpoint must speak the Serper and Jina Reader
+protocols. A value that is not an absolute http(s) URL fails the run with
+exit 2.
+
 PaperQA2 answers from papers, not the web. `BERNSTEIN_PAPER_QA_PAPERS`
-(required) is the directory of papers it indexes and searches. Every model it
-calls - answer, summary, agent, parser enrichment and embedding - is sent to
-the endpoint through LiteLLM's OpenAI provider;
-`BERNSTEIN_PAPER_QA_EMBEDDING` names the embedding model (default
-`text-embedding-3-small`). Paper metadata lookup (Crossref, Semantic Scholar)
-is off, so the papers and the endpoint are the run's only inputs. `PQA_HOME`,
-where PaperQA2 keeps its indexes, is passed through. Its sources are the
-papers the answer cites, one entry each: the paper's URL or DOI link when
-PaperQA2 has one, else its citation. PaperQA2's `unsure` and `truncated`
-statuses record `inconclusive`; `fail` records `driver_failure`.
+(required) is the directory of papers it indexes and searches; a missing
+directory, or one that holds no files, fails the run with exit 2 rather than
+letting PaperQA2 answer with no context. Every model it calls - answer,
+summary, agent, parser enrichment and embedding - is sent to the endpoint
+through LiteLLM's OpenAI provider; `BERNSTEIN_PAPER_QA_EMBEDDING` names the
+embedding model (default `text-embedding-3-small`). Paper metadata lookup
+(Crossref, Semantic Scholar) is off, so the papers and the endpoint are the
+run's only inputs. `PQA_HOME`, where PaperQA2 keeps its indexes, is passed
+through. Its sources are the papers the answer cites, one entry each: the
+paper's URL or DOI link when PaperQA2 has one, else its citation. PaperQA2's
+`unsure` and `truncated` statuses record `inconclusive`; `fail` records
+`driver_failure`.
+
+## Network egress policy
+
+These agents exist to make outbound calls, so a spawn consults the active
+network policy (`--allow-network`, `--profile airgap`) before anything is
+written or started, the same way the other adapters do. A denied destination
+refuses the spawn with `network egress denied by policy: <host>:<port>`.
+
+The destinations are known per spawn, not declared on the class:
+
+| Adapter | Checked |
+|---|---|
+| all three | the gateway from `BERNSTEIN_<AGENT>_OPENAI_BASE_URL` |
+| `gpt_researcher` | the host of every retriever in `RETRIEVER` (default `tavily`; `searx` uses `SEARX_URL`), and the scraper's service for `tavily_extract` / `firecrawl` |
+| `tongyi_deepresearch` | the Serper and Jina bases (the `..._SERPER_BASE_URL` / `..._JINA_BASE_URL` override, else `google.serper.dev` / `r.jina.ai`), and each `SANDBOX_FUSION_ENDPOINT` |
+| `paper_qa` | nothing beyond the gateway: metadata lookup is off and the papers are local |
+
+A URL without a readable host, and a retriever or scraper that is not in the
+table above (`custom`, `mcp`), cannot be placed and so is refused under a
+restrictive policy. Under the default unrestricted policy nothing changes.
+
+Under deny-all, allow the gateway and the tool hosts to run an agent, for
+example `--allow-network localhost --allow-network searx.internal:8443`.
+A host allow-list bounds these services, not the pages the agent fetches
+from search results: those hosts are only known to the search, and the
+policy is not enforced inside the agent's own process. Point the agents at
+a gateway or reader you control if page fetches must be bounded.
 
 ## How the agent runs
 
@@ -87,6 +137,8 @@ editing the checkout:
 - It counts context with the served model's local tokenizer. A gateway model
   has no local tokenizer, so the count is estimated at four characters per
   token, which keeps the agent's context-limit fallback working.
+- With the tool base URLs above set, its search, scholar and visit tools are
+  pointed at them.
 
 Isolation is the spawner's concern, as for every adapter. A container
 backend with the gVisor runtime (`--runtime runsc`) and outbound-only
@@ -98,7 +150,8 @@ nothing on the host.
 | Symptom | Cause |
 |---|---|
 | `set BERNSTEIN_<AGENT>_...` at spawn | a gateway variable or the checkout path is unset |
-| runner exit 2 | the agent is not installed in `BERNSTEIN_<AGENT>_PYTHON`, the Tongyi checkout has no `inference/react_agent.py`, or the PaperQA2 papers directory is missing |
+| `network egress denied by policy` at spawn | the policy denies the gateway or a tool host (see above) |
+| runner exit 2 | the agent is not installed in `BERNSTEIN_<AGENT>_PYTHON`, the Tongyi checkout has no `inference/react_agent.py`, a Tongyi tool base URL is not http(s), or the PaperQA2 papers directory is missing or holds no files |
 | state `driver_failure`, `detail` set | the agent raised; `detail` holds the exception |
 | state `inconclusive` | empty report, or Tongyi stopped without an answer (`detail` says why) |
 | state `tampered` | `report.md` or `sources.json` changed after the run |
