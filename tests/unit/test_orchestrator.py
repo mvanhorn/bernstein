@@ -6550,6 +6550,98 @@ def test_handle_anomaly_signal_kill_reaps_heartbeat_loop(tmp_path: Path) -> None
     assert reap.call_args.kwargs["reason"] == "anomaly_kill"
 
 
+def test_cost_anomaly_stop_defers_claim_until_hold_cleared(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A critical burn-rate signal holds a ready task unclaimed until the hold is cleared."""
+    task = _make_task(id="T-anomaly-hold", title="Hold until recovery")
+    claim_posts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        key = f"{request.method} {request.url.path}"
+        if key == "GET /tasks":
+            return httpx.Response(200, json=[_task_as_dict(task)])
+        if key == "POST /tasks/T-anomaly-hold/claim":
+            claim_posts.append(key)
+            return httpx.Response(200, json={})
+        return httpx.Response(404)
+
+    config = OrchestratorConfig(
+        max_agents=6,
+        poll_interval_s=1,
+        server_url="http://testserver",
+        budget_usd=10.0,
+    )
+    adapter = _mock_adapter()
+    orch = _build_orchestrator(tmp_path, httpx.MockTransport(handler), adapter=adapter, config=config)
+    orch._cost_tracker.record(
+        agent_id="prev-agent",
+        task_id="T-prev",
+        model="sonnet",
+        input_tokens=0,
+        output_tokens=0,
+        cost_usd=9.5,
+    )
+
+    signals = orch._anomaly_detector.check_tick(list(orch._agents.values()), orch._cost_tracker)
+    assert any(sig.action == "stop_spawning" and sig.rule == "burn_rate" for sig in signals)
+    for sig in signals:
+        orch._handle_anomaly_signal(sig)
+    assert orch._stop_spawning is True
+
+    caplog.set_level(logging.WARNING)
+    held = orch.tick()
+
+    adapter.spawn.assert_not_called()
+    assert held.spawned == []
+    assert claim_posts == []
+    assert any("Cost anomaly defer" in rec.message for rec in caplog.records)
+
+    still_held = orch.tick()
+    adapter.spawn.assert_not_called()
+    assert still_held.spawned == []
+    assert claim_posts == []
+
+    orch.clear_anomaly_spawn_hold()
+    assert orch._stop_spawning is False
+
+    resumed = orch.tick()
+
+    assert len(resumed.spawned) == 1
+    assert claim_posts == ["POST /tasks/T-anomaly-hold/claim"]
+
+
+def test_cost_anomaly_disabled_leaves_spawning_unchanged(tmp_path: Path) -> None:
+    """A disabled detector does not latch the spawn hold, even past the burn-rate ceiling."""
+    from bernstein.core.models import CostAnomalyConfig
+
+    task = _make_task(id="T-anomaly-off", title="Spawn anyway")
+    transport = _mock_transport({"GET /tasks": httpx.Response(200, json=[_task_as_dict(task)])})
+    adapter = _mock_adapter()
+    config = OrchestratorConfig(
+        max_agents=6,
+        poll_interval_s=1,
+        server_url="http://testserver",
+        budget_usd=10.0,
+        cost_anomaly=CostAnomalyConfig(enabled=False),
+    )
+    orch = _build_orchestrator(tmp_path, transport, adapter=adapter, config=config)
+    orch._cost_tracker.record(
+        agent_id="prev-agent",
+        task_id="T-prev",
+        model="sonnet",
+        input_tokens=0,
+        output_tokens=0,
+        cost_usd=9.5,
+    )
+
+    assert orch._anomaly_detector.check_tick(list(orch._agents.values()), orch._cost_tracker) == []
+    assert orch._stop_spawning is False
+
+    result = orch.tick()
+
+    assert orch._stop_spawning is False
+    assert len(result.spawned) == 1
+
+
 def test_record_live_costs_accumulates_from_tokens_sidecar(tmp_path: Path) -> None:
     """Ledger spent_usd must accumulate from the .tokens sidecar (bug item-7).
 

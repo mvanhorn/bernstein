@@ -1617,3 +1617,159 @@ def test_bandit_outcome_records_the_effort_the_session_actually_ran_at(
     bandit.record_outcome.assert_called_once()
     _, kwargs = bandit.record_outcome.call_args
     assert kwargs["effort"] == "high"
+
+
+def test_completion_anomaly_routes_rules_and_advances_baseline(tmp_path: Path, make_task: Any) -> None:
+    """Reconciled completion metrics reach the detector and its signals reach the handler.
+
+    Ceiling, token-ratio, and retry-spiral all fire from the cost and token
+    counts the completion path actually reconciled, and the baseline window
+    grows by that task.
+    """
+    from bernstein.core.cost_anomaly import CostAnomalyDetector
+    from bernstein.core.models import CostAnomalyConfig
+
+    detector = CostAnomalyDetector(
+        CostAnomalyConfig(baseline_min_samples=1, token_ratio_min_tokens=100),
+        tmp_path,
+    )
+    detector.check_task_completion("orig", "medium", 0.10, 100, 100)
+    detector.check_task_completion("r1", "medium", 0.10, 100, 100, is_retry=True, original_task_id="orig")
+    detector.check_task_completion("r2", "medium", 0.10, 100, 100, is_retry=True, original_task_id="orig")
+    before = detector._baseline.sample_count
+
+    task = make_task(id="T-anomaly-done", status=TaskStatus.DONE, complexity=Complexity.MEDIUM)
+    task.retry_count = 3
+    task.metadata = {"original_task_id": "orig", "retry_of": "r2"}
+    collector = MagicMock()
+    task_m = SimpleNamespace(
+        cost_usd=1.0,
+        tokens_prompt=100,
+        tokens_completion=800,
+        tokens_used=900,
+        model="sonnet",
+        start_time=10.0,
+        end_time=15.0,
+    )
+    collector.task_metrics = {task.id: task_m}
+    collector.agent_metrics = {"A-1": SimpleNamespace(tasks_completed=1)}
+
+    captured: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    real_check = detector.check_task_completion
+
+    def _spy(*args: Any, **kwargs: Any) -> list[Any]:
+        captured.append((args, kwargs))
+        return real_check(*args, **kwargs)
+
+    detector.check_task_completion = _spy  # type: ignore[method-assign]
+    session = _session_for(task.id, exit_code=0)
+    orch = _process_orch(tmp_path, session)
+    orch._anomaly_detector = detector
+    handled: list[Any] = []
+    orch._handle_anomaly_signal = handled.append
+    orch._spawner.get_worktree_path.return_value = None
+    orch._spawner.reap_completed_agent.return_value = SimpleNamespace(success=True, conflicting_files=[])
+
+    with patch("bernstein.core.tasks.task_lifecycle.get_collector", return_value=collector):
+        result = TickResult()
+        process_completed_tasks(orch, [task], result)
+
+    assert task.id in result.verified
+    assert len(captured) == 1
+    args, kwargs = captured[0]
+    assert args == (task.id, "medium", 1.0, 100, 800)
+    assert kwargs == {"is_retry": True, "original_task_id": "orig"}
+    assert {sig.rule for sig in handled} == {"per_task_ceiling", "token_ratio", "retry_spiral"}
+    assert detector._baseline.sample_count == before + 1
+    assert detector._recent_tasks[-1]["cost"] == 1.0
+    assert detector._recent_tasks[-1]["ratio"] == 8.0
+
+
+def test_completion_anomaly_tolerates_missing_metrics(tmp_path: Path, make_task: Any) -> None:
+    """A completion with no cost or token record still verifies and does not raise."""
+    from bernstein.core.cost_anomaly import CostAnomalyDetector
+    from bernstein.core.models import CostAnomalyConfig
+
+    task = make_task(id="T-zero-metrics", status=TaskStatus.DONE)
+    collector = MagicMock()
+    collector.task_metrics = {}
+    collector.agent_metrics = {}
+    detector = CostAnomalyDetector(CostAnomalyConfig(), tmp_path)
+    session = _session_for(task.id, exit_code=0)
+    orch = _process_orch(tmp_path, session)
+    orch._anomaly_detector = detector
+    handled: list[Any] = []
+    orch._handle_anomaly_signal = handled.append
+    orch._spawner.get_worktree_path.return_value = None
+    orch._spawner.reap_completed_agent.return_value = SimpleNamespace(success=True, conflicting_files=[])
+
+    with patch("bernstein.core.tasks.task_lifecycle.get_collector", return_value=collector):
+        result = TickResult()
+        process_completed_tasks(orch, [task], result)
+
+    assert task.id in result.verified
+    assert handled == []
+    assert detector._baseline.sample_count == 1
+    assert detector._recent_tasks[-1]["cost"] == 0.0
+
+
+def test_pre_spawn_model_mismatch_is_advisory(tmp_path: Path, make_task: Any) -> None:
+    """The final model and complexity are checked, and a mismatch does not block the spawn."""
+    from bernstein.core.cost_anomaly import CostAnomalyDetector
+    from bernstein.core.models import CostAnomalyConfig
+
+    orch = _claim_orch(tmp_path)
+    detector = CostAnomalyDetector(CostAnomalyConfig(), tmp_path)
+    seen: list[tuple[str, str, str]] = []
+    real_check = detector.check_spawn
+
+    def _spy(task_id: str, complexity: str, model: str) -> list[Any]:
+        seen.append((task_id, complexity, model))
+        return real_check(task_id, complexity, model)
+
+    detector.check_spawn = _spy  # type: ignore[method-assign]
+    orch._anomaly_detector = detector
+    handled: list[Any] = []
+    orch._handle_anomaly_signal = handled.append
+
+    task = make_task(id="T-mismatch", complexity=Complexity.LOW)
+    task.model = "claude-opus-4"
+    session = AgentSession(
+        id="A-mismatch",
+        role="backend",
+        task_ids=[task.id],
+        model_config=ModelConfig("claude-opus-4", "high"),
+    )
+    orch._spawner.spawn_for_tasks.return_value = session
+    result = TickResult()
+
+    claim_and_spawn_batches(orch, [[task]], alive_count=0, assigned_task_ids=set(), done_ids=set(), result=result)
+
+    assert seen == [("T-mismatch", "small", "claude-opus-4")]
+    assert [sig.rule for sig in handled] == ["model_mismatch"]
+    assert handled[0].action == "log"
+    assert result.spawned == [session.id]
+    assert result.errors == []
+    orch._client.post.assert_called()
+
+
+def test_spawn_error_preserved_when_anomaly_check_runs(tmp_path: Path, make_task: Any) -> None:
+    """An advisory pre-spawn signal does not replace a real spawn failure."""
+    from bernstein.core.cost_anomaly import CostAnomalyDetector
+    from bernstein.core.models import CostAnomalyConfig
+
+    orch = _claim_orch(tmp_path)
+    detector = CostAnomalyDetector(CostAnomalyConfig(), tmp_path)
+    orch._anomaly_detector = detector
+    handled: list[Any] = []
+    orch._handle_anomaly_signal = handled.append
+    task = make_task(id="T-spawn-err", complexity=Complexity.LOW)
+    task.model = "claude-opus-4"
+    orch._spawner.spawn_for_tasks.side_effect = RuntimeError("process failed to start")
+    result = TickResult()
+
+    claim_and_spawn_batches(orch, [[task]], alive_count=0, assigned_task_ids=set(), done_ids=set(), result=result)
+
+    assert result.spawned == []
+    assert any("process failed to start" in err for err in result.errors)
+    assert [sig.rule for sig in handled] == ["model_mismatch"]

@@ -2323,6 +2323,109 @@ def _clear_claim_conflict_state(orch: Any, task_id: str) -> None:
         state.pop(task_id, None)
 
 
+# Detector tiers are small/medium/large. Task.complexity is low/medium/high.
+# Translate at the boundary so ceiling and model-mismatch compare against
+# the tier those rules were written for. Unknown labels pass through.
+_ANOMALY_COMPLEXITY: dict[str, str] = {
+    "low": "small",
+    "medium": "medium",
+    "high": "large",
+}
+
+
+def _anomaly_complexity(task: Task) -> str:
+    """Return the detector complexity tier for *task*."""
+    raw = getattr(task.complexity, "value", task.complexity)
+    text = str(raw or "medium")
+    return _ANOMALY_COMPLEXITY.get(text, text)
+
+
+def _dispatch_anomaly_signals(orch: Any, signals: list[Any]) -> None:
+    """Route detector signals through the orchestrator's handler.
+
+    A missing handler or a handler failure must not change claim, spawn,
+    verification, or retry outcomes. ``enabled=False`` never reaches here:
+    the detector returns an empty list.
+    """
+    handler = getattr(orch, "_handle_anomaly_signal", None)
+    if not callable(handler):
+        return
+    for sig in signals:
+        try:
+            handler(sig)
+        except Exception:
+            logger.warning("cost anomaly signal dispatch failed", exc_info=True)
+
+
+def _route_spawn_anomaly_signals(orch: Any, batch: list[Task], *, model: str | None = None) -> None:
+    """Advisory pre-spawn check. Model mismatch does not block the spawn.
+
+    *model* is the final model for this attempt when the caller already
+    knows it (an A/B override). Otherwise each task's selected model is
+    used, which is empty when the spawner will still resolve a default.
+    """
+    detector = getattr(orch, "_anomaly_detector", None)
+    check = getattr(detector, "check_spawn", None)
+    if not callable(check):
+        return
+    for task in batch:
+        chosen = model if model is not None else (task.model or "")
+        try:
+            signals = check(task.id, _anomaly_complexity(task), chosen)
+        except Exception:
+            logger.warning("cost anomaly check_spawn failed for task %s", task.id, exc_info=True)
+            continue
+        _dispatch_anomaly_signals(orch, signals)
+
+
+def _completion_is_retry(task: Task) -> bool:
+    """True when *task* is a retry of an earlier attempt in its lineage."""
+    if task.retry_count:
+        return True
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    retry_of = metadata.get("retry_of")
+    if isinstance(retry_of, str) and retry_of:
+        return True
+    original = metadata.get("original_task_id")
+    return isinstance(original, str) and bool(original) and original != task.id
+
+
+def _route_completion_anomaly_signals(orch: Any, task: Task, task_m: Any, cost_usd: float) -> None:
+    """Run completion anomaly checks on reconciled cost and token counts.
+
+    Called only after ``_record_completion_metrics`` has folded sidecar and
+    collector figures into *task_m* / *cost_usd*. Missing metrics are zeros.
+    The detector updates its baseline as part of ``check_task_completion``.
+    """
+    detector = getattr(orch, "_anomaly_detector", None)
+    check = getattr(detector, "check_task_completion", None)
+    if not callable(check):
+        return
+    if task_m is None:
+        tokens_in = 0
+        tokens_out = 0
+    else:
+        tokens_in = int(getattr(task_m, "tokens_prompt", 0) or 0)
+        tokens_out = int(getattr(task_m, "tokens_completion", 0) or 0)
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    original = metadata.get("original_task_id")
+    original_task_id = original if isinstance(original, str) and original else _lineage_id(task)
+    try:
+        signals = check(
+            task.id,
+            _anomaly_complexity(task),
+            float(cost_usd or 0.0),
+            tokens_in,
+            tokens_out,
+            is_retry=_completion_is_retry(task),
+            original_task_id=original_task_id,
+        )
+    except Exception:
+        logger.warning("cost anomaly check_task_completion failed for task %s", task.id, exc_info=True)
+        return
+    _dispatch_anomaly_signals(orch, signals)
+
+
 def _lineage_id(task: Task) -> str:
     """Return the task's lineage id: ``metadata["original_task_id"]`` or its id.
 
@@ -2981,6 +3084,7 @@ def claim_and_spawn_batches(
             )
             if resume_worktree is not None:
                 changed_files = _get_changed_files_in_worktree(resume_worktree)
+                _route_spawn_anomaly_signals(orch, batch)
                 session = orch._spawner.spawn_for_resume(
                     batch,
                     worktree_path=resume_worktree,
@@ -2995,6 +3099,7 @@ def claim_and_spawn_batches(
                     [t.id for t in batch],
                 )
             else:
+                _route_spawn_anomaly_signals(orch, batch)
                 session = orch._spawner.spawn_for_tasks(batch)
 
             if _shadow_bandit_decision is not None and _routing_bandit is not None:
@@ -3037,6 +3142,7 @@ def claim_and_spawn_batches(
                         _ab_split_tracker = getattr(orch, "_ab_split_tracker", None)
                         if isinstance(_ab_split_tracker, dict):
                             _ab_split_tracker[ab_task.id] = routed_model
+                        _route_spawn_anomaly_signals(orch, batch, model=routed_model)
                         alt_session = orch._spawner.spawn_for_tasks(batch, model_override=routed_model)
                         alt_session.timeout_s = batch_timeout_s
                         # Replace the primary session with the routed alt session
@@ -5230,6 +5336,7 @@ def _process_single_completed_task(
         completion_data,
         agent_just_reaped,
     )
+    _route_completion_anomaly_signals(orch, task, task_m, cost_usd)
 
     _post_completion_bulletin(orch, task, janitor_passed, cache_verified, cache_diff_lines)
 

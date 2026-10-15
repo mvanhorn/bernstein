@@ -755,6 +755,11 @@ class Orchestrator:
         from bernstein.core.cost_anomaly import CostAnomalyDetector
 
         self._anomaly_detector = CostAnomalyDetector(config.cost_anomaly, workdir)
+        # Sticky hold set by ``stop_spawning`` signals. The spawn decision
+        # reads this before claiming a batch. Detector cooldowns only
+        # suppress repeat signals; they do not reopen spawning.
+        # ``clear_anomaly_spawn_hold`` is the resume path.
+        self._stop_spawning = False
 
         # Context degradation detector: flags agents whose cross-model review
         # verdicts decline (N consecutive rejects).  Degraded sessions are
@@ -2144,6 +2149,10 @@ class Orchestrator:
             )
             # Fire a one-shot notification when the action first transitions.
             # (apply_policy writes this into self._last_budget_action.)
+        elif self._stop_spawning:
+            # Hold before claim. A batch that will not launch must not be
+            # left claimed with no agent.
+            self._defer_spawns_for_anomaly_hold(batches)
         else:
             claim_and_spawn_batches(self, batches, alive_count, assigned_task_ids, done_ids, result)
 
@@ -4341,7 +4350,15 @@ class Orchestrator:
         done_ids: set[str],
         result: TickResult,
     ) -> None:
-        """Delegate to task_lifecycle.claim_and_spawn_batches."""
+        """Delegate to task_lifecycle.claim_and_spawn_batches.
+
+        A cost-anomaly stop hold is applied here as well as in the tick
+        spawn decision, so a direct caller cannot claim a batch the tick
+        would have deferred.
+        """
+        if self._stop_spawning:
+            self._defer_spawns_for_anomaly_hold(batches)
+            return
         claim_and_spawn_batches(self, batches, alive_count, assigned_task_ids, done_ids, result)
 
     def _process_completed_tasks(self, done_tasks: list[Task], result: TickResult) -> None:
@@ -4364,8 +4381,49 @@ class Orchestrator:
             run_pinned_model=getattr(self._spawner, "default_model", None),
         )
 
+    def _defer_spawns_for_anomaly_hold(self, batches: list[list[Task]]) -> None:
+        """Log a deferral and skip claiming while stop-spawning is held.
+
+        Empty batches are silent: there is nothing to claim. The hold stays
+        set until :meth:`clear_anomaly_spawn_hold`.
+        """
+        if not batches:
+            return
+        logger.warning(
+            "Cost anomaly defer: stop_spawning hold is active; deferring %d ready "
+            "batch(es) without claiming (run=%s). Resume with clear_anomaly_spawn_hold() "
+            "after recovery.",
+            len(batches),
+            self._run_id,
+        )
+
+    def clear_anomaly_spawn_hold(self) -> None:
+        """Clear a cost-anomaly stop-spawning hold so a recovered run can resume.
+
+        ``_handle_anomaly_signal`` sets ``_stop_spawning`` when a detector
+        signal's action is ``stop_spawning`` (budget burn rate or a retry
+        spiral). The tick spawn decision and ``_claim_and_spawn_batches``
+        read that flag and defer ready batches without claiming them.
+
+        The hold is sticky on purpose. The detector's cooldown only
+        suppresses a repeat signal; it does not reopen spawning. Call this
+        after the run has recovered (budget raised, or the spiral
+        acknowledged) to let the next tick claim and launch again. A later
+        signal can set the hold again.
+        """
+        if self._stop_spawning:
+            logger.info(
+                "Cost anomaly spawn hold cleared; spawning may resume (run=%s)",
+                self._run_id,
+            )
+        self._stop_spawning = False
+
     def _handle_anomaly_signal(self, signal: object) -> None:
-        """Dispatch an anomaly signal: log, stop spawning, or kill agent."""
+        """Dispatch an anomaly signal: log, stop spawning, or kill agent.
+
+        ``stop_spawning`` latches ``_stop_spawning``. Spawn paths refuse to
+        claim until :meth:`clear_anomaly_spawn_hold`.
+        """
         import contextlib
 
         from bernstein.core.agents import heartbeat as heartbeat_protocol
